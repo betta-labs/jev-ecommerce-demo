@@ -1,17 +1,32 @@
 import { experimental_evaluate as evaluate } from "ai";
 import { NextRequest, NextResponse } from "next/server";
+import { buildDecision } from "@/lib/triage";
+
+/** 消息长度上限，防止异常输入直烧 Gateway 费用 */
+const MAX_MESSAGE_LENGTH = 2000;
 
 export async function POST(req: NextRequest) {
     try {
-        const body = await req.json();
-        const message = body.message;
+        const body: unknown = await req.json();
+        const message = (body as { message?: unknown } | null)?.message;
 
-        if (!message || typeof message !== "string") {
+        if (typeof message !== "string" || message.length === 0) {
             return NextResponse.json(
                 { error: "请输入售后消息" },
                 { status: 400 },
             );
         }
+
+        if (message.length > MAX_MESSAGE_LENGTH) {
+            return NextResponse.json(
+                {
+                    error: `消息过长（${message.length} 字），上限 ${MAX_MESSAGE_LENGTH} 字`,
+                },
+                { status: 400 },
+            );
+        }
+
+        const startedAt = performance.now();
 
         const result = await evaluate({
             model: "typesafe-ai/jev",
@@ -44,7 +59,8 @@ export async function POST(req: NextRequest) {
                 },
                 angry: {
                     type: "boolean",
-                    instructions: "顾客是否表达了强烈不满、威胁差评或投诉？",
+                    instructions:
+                        "顾客是否表达了强烈不满、威胁差评或投诉？",
                 },
             },
             providerOptions: {
@@ -54,53 +70,30 @@ export async function POST(req: NextRequest) {
             },
         });
 
-        const answers = result.answers;
+        const latencyMs = Math.round(performance.now() - startedAt);
+        const decision = buildDecision(result.answers);
 
-        // 决策逻辑
-        let finalDecision = "正常路由处理";
-        let priority = "普通";
-        let reason = "";
-
-        const urgencyScore = answers.urgency?.score ?? 0;
-        const angryProb = answers.angry?.probability ?? 0;
-        const refundProb = answers.wants_refund?.probability ?? 0;
-        const category = answers.category?.choice ?? "other";
-        const topProb = answers.category?.probabilities?.[category] ?? 0;
-
-        if (urgencyScore >= 2.5 || angryProb > 0.7) {
-            priority = "高优";
-            finalDecision = "建议立即转人工处理";
-            reason = `紧急程度较高（${urgencyScore.toFixed(2)}）或强烈不满概率 ${(angryProb * 100).toFixed(0)}%，建议优先人工介入。`;
-        } else if (category === "return_refund" && refundProb > 0.65) {
-            finalDecision = "进入退换货/退款流程";
-            priority = refundProb > 0.85 ? "较高" : "普通";
-            reason = `明确倾向退款/退货（概率 ${(refundProb * 100).toFixed(0)}%），路由至 return_refund 流程。`;
-        } else if (category === "logistics") {
-            finalDecision = "路由到物流组查询";
-            reason = `主要问题集中在物流相关（置信度 ${(topProb * 100).toFixed(0)}%）。`;
-        } else if (category === "product_quality") {
-            finalDecision = "路由到质量问题处理";
-            reason = `主要涉及质量/尺码问题（置信度 ${(topProb * 100).toFixed(0)}%）。`;
-        } else {
-            reason = `综合路由分组「${category}」（${(topProb * 100).toFixed(0)}%）、紧急程度 ${urgencyScore.toFixed(2)}、退款意愿 ${(refundProb * 100).toFixed(0)}%，按正常流程处理。`;
-        }
+        // TypeSafe 特有的置信度统计（按问题 ID 分键，区别于选项概率分布）
+        const typesafeMeta = result.providerMetadata?.typesafe as
+            | { confidence?: Record<string, number> }
+            | undefined;
 
         return NextResponse.json({
             success: true,
-            answers,
-            decision: {
-                final: finalDecision,
-                priority,
-                category,
-                reason,
+            answers: result.answers,
+            decision,
+            confidence: typesafeMeta?.confidence,
+            meta: {
+                latencyMs,
+                model: result.response.modelId,
+                responseId: result.response.id,
+                usage: result.usage,
             },
-            usage: result.usage,
         });
-    } catch (error: any) {
+    } catch (error: unknown) {
+        const messageText =
+            error instanceof Error ? error.message : "分析失败，请稍后重试";
         console.error("Triage API Error:", error);
-        return NextResponse.json(
-            { error: error.message || "分析失败，请稍后重试" },
-            { status: 500 },
-        );
+        return NextResponse.json({ error: messageText }, { status: 500 });
     }
 }
